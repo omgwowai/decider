@@ -26,6 +26,80 @@ local Qwen3.5-27B teacher (`teacher_data/`, `decider/data/mixture.py`). Nothing 
 [Quick start](#quick-start) · [Train your own](#train-your-own) · [How it works](#how-it-works) ·
 [Limits](#limits-stated-plainly) · [Results](https://github.com/Mapika/decider/blob/main/docs/RESULTS.md)
 
+## Team fork deployment (NVIDIA CUDA)
+
+This fork is maintained at `omgwowai/decider`. In the autonomy scaffold it is pinned as the
+`services/decider` Git submodule. Initialize submodules, then run from the scaffold root:
+
+```sh
+git submodule update --init --recursive
+python services/decider/deploy.py
+```
+
+The launcher creates `services/decider/.venv-deploy`, installs **this checkout** and its serving
+dependencies (not the public `decider-ai` release), downloads `Mapika/decider-0.8b` at immutable commit
+`a0a01d6f8135298f400a8c856b355793012ae971`, checks real CUDA bfloat16 execution, and runs the official
+`decider.serve:app` with one process on **127.0.0.1:8102**. Python 3.11 or 3.12 and a compatible NVIDIA
+driver are required for managed installation. It installs PyTorch 2.8 CUDA 12.8 wheels; Windows also
+installs `triton-windows` 3.4. FLA 0.5.2 avoids pulling the Linux-only Triton package on Windows.
+An installation/import/CUDA/warmup error aborts instead of silently using CPU. Initial graph warmup
+can take time and GPU memory; the launch banner alone is not evidence of readiness.
+
+To use an **existing compatible GPU Python without changing its packages**, explicitly opt out of installation:
+
+```sh
+python services/decider/deploy.py --python /path/to/gpu/python --skip-install --local-model /path/to/decider-0.8b --port 8102
+```
+
+Windows accepts paths such as `--python D:/envs/gpu/Scripts/python.exe`. `--local-model` requires a
+complete checkpoint with configuration, tokenizer and safetensors files and does not download weights.
+Without it, weights use the dedicated ignored `.cache/huggingface` directory. Override `--model`
+only together with an immutable 40-character `--revision`; `main` and tags are rejected.
+Other options: `--venv`, `--cache-dir`, `--host`, `--device cuda:0`, `--max-batch` (8),
+`--batch-wait-ms` (0), `--token-budget` (8192), and `--max-pending` (64). No 8100/8101 service is
+stopped or modified. Inherited `DECIDER_*` experiment settings are cleared for the launched service;
+the current checkout is selected explicitly, and model loading after download is offline.
+
+```sh
+curl http://127.0.0.1:8102/health
+```
+
+Require both `ok: true` and `cuda_ready: true`, with a CUDA `device`. Model creation, schema-cache
+initialization, graph warmup, final synchronization and inference all run on the same GPU owner thread.
+Failed or incomplete batches return errors, not partial success. Pending requests are bounded **before
+tokenization**, in addition to the existing row limit; a disconnected client does not release capacity
+while its inference is still running. Overload returns HTTP 503.
+
+The scaffold uses `POST /v1/systemone` with the official envelope:
+
+```json
+{"state":"{\"need\":\"food\"}","questions":{"selection":{"type":"choice","instructions":"Choose the next action","criteria":{"eat":"Eat available food","rest":"Rest on the sofa"}}},"independent":true,"layout":"state_first"}
+```
+
+`state` is a compact JSON **string**, not a flattened feature summary. Criteria retain insertion order.
+Responses remain `{model, answers, usage}`. This deployment enables `DECIDER_REJECT_TRUNCATION=1`:
+oversized states/rows/requests fail with HTTP 413 rather than silently losing state. The token budget
+limits total request scoring tokens and padded microbatches. Shared-prefix and schema-cache opt-ins
+are disabled for this state-first deployment; the upstream native features and other device paths
+remain available when starting `decider.serve` directly with its documented environment options.
+
+Library users may opt into `Decider(..., fixed_length=192)` (CUDA graphs required), or
+`Engine(..., fixed_length=192)`. Complete prepared rows are padded to exactly that length; oversized
+rows raise `ValueError` before inference, including shared-prefix calls. The default remains bucketed.
+The HTTP server retains the upstream `EngineV2` pre-captured bucket grid rather than replacing it with
+the older single-shape service. Existing library prompt context limits still apply before row scoring.
+
+Security boundary: the API has no authentication; keep loopback binding. Explicit non-loopback
+`--host` requires your own authenticated proxy/firewall and request-body limits. Only load trusted
+model checkpoints. No game mutations are performed by this service. Do not commit environments,
+model caches, weights, logs or experiment data.
+
+Focused regression tests (from this submodule; no model download is needed for these contracts):
+
+```sh
+python -m pytest tests/test_deploy.py tests/test_engine_fixed_length.py tests/test_serve_http.py tests/test_serve_prepare.py tests/test_serve_device.py
+```
+
 ## What's new
 
 * **2026-09-22 — decider-4b v1.** Qwen3.5-4B-Base, one pass over mixture v2 (the public mixture plus 26 further public

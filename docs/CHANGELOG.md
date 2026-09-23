@@ -3,6 +3,16 @@
 Newest first. Every entry names the weights it applies to; the Hub repositories keep earlier weights under tags where noted.
 `HISTORY.md` is the long form: how each stage was trained and what was measured.
 
+## Team fork — unreleased
+
+Code-only changes for `omgwowai/decider`; published model weights are unchanged.
+
+- Add an isolated NVIDIA deployment launcher for the scaffold submodule. Install this checkout, pin the default 0.8B checkpoint revision, verify CUDA execution, and expose the official System One API on loopback port 8102.
+- Keep model construction, graph warmup, synchronization and scoring on one GPU owner thread; report CUDA readiness only after startup completes.
+- Bound pending requests before tokenization and preserve reservations until accepted work settles, including disconnected clients and failed batches.
+- Reject oversized state input in the scaffold deployment rather than silently truncating it.
+- Add optional exact `fixed_length` padding to the library Engine/Decider, rejecting oversized prepared rows without changing default bucketed inference.
+
 ## 1.2.1 (2026-09-23): jinja2 is a dependency
 
 Code only; no weights change. The chat layout of 1.2.0 builds its prompts with the tokenizer's chat template

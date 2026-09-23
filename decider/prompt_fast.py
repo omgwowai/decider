@@ -12,8 +12,15 @@ so the ids are exactly `ctx_ids + question_piece`; this module reuses that fact 
 from decider.prompt import LETTERS, NARROW, MAX_OPTIONS, label_table, _enc_opt, _options_ids
 
 
-def context_ids(tok, context, max_ctx_tokens=32768):
-    return tok.encode("Context:\n" + context, add_special_tokens=False)[:max_ctx_tokens]
+class ContextTooLong(ValueError):
+    pass
+
+
+def context_ids(tok, context, max_ctx_tokens=32768, reject_overflow=False):
+    ids = tok.encode("Context:\n" + context, add_special_tokens=False)
+    if reject_overflow and len(ids) > max_ctx_tokens:
+        raise ContextTooLong(f"state has {len(ids)} tokens, exceeding DECIDER_MAX_STATE_TOKENS={max_ctx_tokens}; input was not truncated")
+    return ids[:max_ctx_tokens]
 
 
 def question_piece(tok, text, options, k=0, multi=False):
@@ -49,14 +56,14 @@ def _chat_row(tok, chat, ctx, row):
     return ids, slots
 
 
-def build_rows(tok, context, rows, max_ctx_tokens=32768, chat=None):
+def build_rows(tok, context, rows, max_ctx_tokens=32768, chat=None, reject_overflow=False):
     """rows: list of rows, each a list of (question text, options).  -> (items, len(ctx_ids)).
 
     Option order is kept as given (no shuffling, no subsetting): systemone.render_question already caps a choice at
     MAX_OPTIONS options, so prompt.build's sampling branch is unreachable here.
     chat: a ChatTemplate (prompt.chat_template) for a chat-layout model; the shared ids are then the template head plus the
     context, and each row is prompt.build_chat's rendering."""
-    ctx = context_ids(tok, context, max_ctx_tokens)
+    ctx = context_ids(tok, context, max_ctx_tokens, reject_overflow)
     if chat is not None:
         ctx = list(chat.head) + ctx
     items = []

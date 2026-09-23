@@ -67,7 +67,8 @@ class Decider:
     the optional MPS patch; CPU defaults to bfloat16. Set ``use_graphs=False``
     for eager execution or debugging.
     """
-    def __init__(self, path, device=None, dtype=None, temperature=None, abstain_below=0.0, use_graphs=None):
+    def __init__(self, path, device=None, dtype=None, temperature=None, abstain_below=0.0, use_graphs=None,
+                 fixed_length=None):
         """The prompt layout comes from decider_config.json: "layout": "chat" (chat-trained checkpoints) wraps every prompt in the
         tokenizer's chat template (decider.prompt.build_chat); no "layout" key is the plain layout of every earlier model.
         An unknown layout raises ValueError before the weights are loaded."""
@@ -90,9 +91,11 @@ class Decider:
         self.neutralize_none = bool(cfg.get("neutralize_none", True))   # v4 and earlier learned the literal string as an abstain signal
         if use_graphs is None:
             use_graphs = str(device).startswith("cuda")
+        if fixed_length is not None and not use_graphs:
+            raise ValueError("fixed_length requires use_graphs=True")
         if use_graphs:
             from decider.engine import Engine
-            self.eng = Engine(path, device=device, dtype=dtype); self.m = self.eng.m
+            self.eng = Engine(path, device=device, dtype=dtype, fixed_length=fixed_length); self.m = self.eng.m
         else:
             if str(device).startswith("mps"):
                 from decider.mps_ops import patch_mps

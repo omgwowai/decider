@@ -526,3 +526,135 @@ def test_decide_schemas_1_1_2_answered_still_answer(served):
         assert list(r.json()) == list(s)
         if want is not None:
             assert r.json() == want
+
+
+def test_strict_state_overflow_is_413_without_scoring(served, monkeypatch):
+    eng, run = served
+    monkeypatch.setattr(serve, "REJECT_TRUNCATION", True)
+    monkeypatch.setattr(serve, "MAX_STATE_TOKENS", 30)
+    async def fn(cl):
+        return await cl.post("/v1/systemone", json={"state": "important-tail" * 10, "questions": QUESTIONS, "layout": "state_first"})
+    response = run(fn)
+    assert response.status_code == 413
+    assert "not truncated" in response.json()["detail"]
+    assert not eng.calls
+
+
+def test_complete_state_and_candidate_order_are_preserved(served, monkeypatch):
+    eng, run = served
+    monkeypatch.setattr(serve, "REJECT_TRUNCATION", True)
+    state = '{"fact":"完整状态","tail":"must survive"}'
+    criteria = {"z-last": "First description", "a-first": "Second description"}
+    captured = []
+    original = eng.score_items
+    def score(items, temperature=1.0):
+        captured.extend(items)
+        return original(items, temperature)
+    eng.score_items = score
+    async def fn(cl):
+        return await cl.post("/v1/systemone", json={"state": state, "questions": {"selection": {
+            "type": "choice", "instructions": "Choose", "criteria": criteria}}, "independent": True, "layout": "state_first"})
+    response = run(fn)
+    assert response.status_code == 200
+    assert list(response.json()["answers"]["selection"]["probabilities"]) == list(criteria)
+    prompt = bytes(captured[0]["ids"]).decode("utf-8")
+    assert state in prompt
+    assert prompt.index("First description") < prompt.index("Second description")
+
+
+@pytest.mark.parametrize("failure", ["planner", "incomplete", "inference"])
+def test_batch_errors_finish_request_instead_of_hanging(served, monkeypatch, failure):
+    eng, run = served
+    def broken(*args, **kwargs):
+        raise RuntimeError("injected batch failure")
+    if failure == "planner":
+        monkeypatch.setattr(serve, "plan_batches", broken)
+    elif failure == "incomplete":
+        eng.score_items = lambda *args, **kwargs: []
+    else:
+        eng.score_items = broken
+    async def fn(cl):
+        return await asyncio.wait_for(cl.post("/v1/systemone", json={"state": "s", "questions": QUESTIONS}), 2)
+    assert run(fn).status_code == 500
+    assert serve.outstanding == 0
+
+
+def test_disconnected_request_keeps_bounded_reservation(served, monkeypatch):
+    _, run = served
+    monkeypatch.setattr(serve, "MAX_PENDING_REQUESTS", 1)
+    async def fn(cl):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def work(request):
+            entered.set()
+            await release.wait()
+            return "complete"
+        caller = asyncio.create_task(serve._bounded_request(work, None))
+        await entered.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        try:
+            with pytest.raises(serve.HTTPException) as exc:
+                await serve._bounded_request(work, None)
+            assert exc.value.status_code == 503
+            assert len(serve.pending_requests) == 1
+        finally:
+            active = list(serve.pending_requests)
+            release.set()
+            await asyncio.gather(*active)
+        assert not serve.pending_requests
+    run(fn)
+
+
+def test_cuda_readiness_waits_for_warmup_and_owner_thread(monkeypatch):
+    import sys, threading
+    from types import SimpleNamespace
+    torch = pytest.importorskip("torch")
+    events = []
+    entered, release = threading.Event(), threading.Event()
+    class OwnedEngine(FakeEngine):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.dev = "cuda:0"; self.cfg = {}; self.use_graphs = True; self.sealed = False
+            events.append(("load", threading.get_ident()))
+        def warmup(self, log=None):
+            events.append(("warmup", threading.get_ident()))
+            entered.set()
+            if not release.wait(5): raise RuntimeError("test warmup release missing")
+            return 0
+        def seal(self):
+            events.append(("seal", threading.get_ident()))
+            self.sealed = True
+        def score_items(self, items, temperature=1.0):
+            events.append(("score", threading.get_ident()))
+            return super().score_items(items, temperature)
+    monkeypatch.setitem(sys.modules, "decider.engine_v2", SimpleNamespace(EngineV2=OwnedEngine))
+    monkeypatch.setattr(serve, "load_config", lambda path: {})
+    monkeypatch.setattr(serve, "resolve_device", lambda: ("cuda:0", torch.bfloat16))
+    monkeypatch.setattr(serve, "WARMUP", True)
+    monkeypatch.setattr(serve, "eng", None)
+    monkeypatch.setattr(serve, "gpu", None)
+    monkeypatch.setattr(serve, "cpu", None)
+    monkeypatch.setattr(serve, "se", None)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: events.append(("device", threading.get_ident())))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append(("sync", threading.get_ident())))
+    async def go():
+        starting = asyncio.create_task(serve._start())
+        try:
+            assert await asyncio.get_running_loop().run_in_executor(None, entered.wait, 2)
+            assert (await serve.health())["ok"] is False
+            assert (await serve.health())["cuda_ready"] is False
+            release.set()
+            await starting
+            assert (await serve.health())["cuda_ready"] is True
+            async with _client(serve.app) as cl:
+                assert (await cl.post("/v1/systemone", json={"state": "s", "questions": QUESTIONS})).status_code == 200
+        finally:
+            release.set()
+            await starting
+            serve._stop()
+        assert (await serve.health())["cuda_ready"] is False
+    _run(go())
+    assert [name for name, _ in events] == ["device", "load", "warmup", "seal", "sync", "score"]
+    assert len({owner for _, owner in events}) == 1
+    assert events[0][1] != threading.get_ident()
