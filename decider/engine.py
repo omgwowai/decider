@@ -75,9 +75,13 @@ def set_attention_backend_policy():
 class Engine:
     """compile: torch.compile the forward (needs use_cache=False; ~1.4x batched, fuses elementwise work).
     fp8: e4m3 weights + per-token activation scaling on the big linears (Hopper tensor cores).
-    conv_patch: fusable depthwise causal conv instead of the cuDNN fallback."""
+    conv_patch: fusable depthwise causal conv instead of the cuDNN fallback.
+    fixed_length: opt-in exact padding length; oversized items fail before inference."""
     def __init__(self, path, device="cuda", dtype=torch.bfloat16, use_graphs=True, max_ctx_tokens=1536,
-                 compile=True, fp8=False, conv_patch=True):
+                 compile=True, fp8=False, conv_patch=True, fixed_length=None):
+        if fixed_length is not None and (type(fixed_length) is not int or not 1 <= fixed_length <= GRAPH_MAX_T):
+            raise ValueError(f"fixed_length must be an integer in 1..{GRAPH_MAX_T}")
+        self.fixed_length = fixed_length
         set_attention_backend_policy()
         if conv_patch:
             if str(device).startswith("mps"):
@@ -142,7 +146,12 @@ class Engine:
     def score_items(self, items, temperature=1.0):
         """items: list of dicts from prompt.build. Returns list of [n_q, MAX_OPTIONS] prob tensors (cpu)."""
         Tmax = max(len(it["ids"]) for it in items)
-        T = _bucket(Tmax, T_BUCKETS) or -(-Tmax // LONG_STEP) * LONG_STEP
+        if self.fixed_length is not None:
+            if Tmax > self.fixed_length:
+                raise ValueError(f"Input length {Tmax} exceeds fixed_length={self.fixed_length}")
+            T = self.fixed_length
+        else:
+            T = _bucket(Tmax, T_BUCKETS) or -(-Tmax // LONG_STEP) * LONG_STEP
         B = (_bucket(len(items), B_BUCKETS) or len(items)) if T <= GRAPH_MAX_T else len(items)
         ids = fill_ids([it["ids"] for it in items], B, T, self.tok.pad_token_id)
         out = self.logits_all(ids.to(self.dev, non_blocking=True))
@@ -156,6 +165,8 @@ class Engine:
         Same answers as score_items up to kernel round-off; cost ~ state + sum(questions) instead of n * state.
         The fork is made in chunks that fit `DECIDER_SHARED_FORK_GB`, so the peak memory does not grow with the question
         count; the implementation is decider.shared_prefix, shared with EngineV2."""
+        if self.fixed_length is not None:
+            return self.score_items(items, temperature)
         from decider import shared_prefix                      # imported here: decider.shared_prefix imports this module
         out = shared_prefix.score_shared(self, items, temperature, min_prefix)
         if out is None:

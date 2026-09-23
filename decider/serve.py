@@ -49,7 +49,7 @@ from pydantic import BaseModel
 from decider import systemone as S1
 from decider.batching import DEFAULT_MERGE_OVERHEAD_TOKENS, plan_batches
 from decider.prompt import build, MAX_OPTIONS, resolve_layout, chat_template
-from decider.prompt_fast import build_rows, unique_tokens
+from decider.prompt_fast import build_rows, unique_tokens, context_ids, ContextTooLong
 
 
 def _env_int(name, default):
@@ -76,12 +76,16 @@ MAX_ROWS = _env_int("DECIDER_MAX_ROWS", 1024)                               # sc
 MAX_ROW_TOKENS = _env_int("DECIDER_MAX_ROW_TOKENS", MAX_STATE_TOKENS + 4096)  # tokens in one row: truncated state + question block
 MAX_REQUEST_TOKENS = _env_int("DECIDER_MAX_REQUEST_TOKENS", 1 << 20)       # sum of row lengths of one request
 MAX_QUEUE_ROWS = _env_int("DECIDER_MAX_QUEUE_ROWS", 4096)                   # rows admitted and not yet scored, over all requests
+MAX_PENDING_REQUESTS = _env_int("DECIDER_MAX_PENDING_REQUESTS", 64)          # includes CPU preparation and GPU work
+REJECT_TRUNCATION = os.environ.get("DECIDER_REJECT_TRUNCATION", "0") == "1"
 DECIDE_MAX_CTX_TOKENS = 1536                                                # /decide context cap, unchanged from 1.0.x
 
 MODEL_NAME = "decider"; TEMP = 1.0; TEMP_SCHEMA = 1.0; RELEASE_DATE = "2026-09-17"; ISOLATED = False; NEUTRALIZE_NONE = True
 SCHEMA_FIRST = False; LAYOUT = "plain"; CHAT = None; se = None; squeue = None; schemas = {}; seen = {}
 eng = None; queue = None; gpu = None; cpu = None; batcher_task = None; schema_task = None
 outstanding = 0; REQ_SEQ = 0
+pending_requests = set()
+cuda_ready = False
 stats = dict(requests=0, batches=0, decisions=0, rows=0, shared_prefix_requests=0, errors=0, rejected_too_large=0,
              rejected_overloaded=0, batch_hist={}, bucket_hist={})
 
@@ -108,7 +112,7 @@ class _NoShuffle:
     def sample(self, xs, k): return xs[:k]
 
 
-def prepare(tok, state, questions, independent, isolated=False, max_state_tokens=32768, chat=None):
+def prepare(tok, state, questions, independent, isolated=False, max_state_tokens=32768, chat=None, reject_overflow=False):
     """Render, plan the rows, tokenize the state once.  -> (rqs, index, items, ctx_len).  The rows are those
     `prompt.build` produces for the same request (tests/test_prompt_fast.py, tests/test_serve_prepare.py); chat: the
     ChatTemplate of a chat-layout model, None for the plain layout."""
@@ -117,12 +121,17 @@ def prepare(tok, state, questions, independent, isolated=False, max_state_tokens
     flat, index = S1.plan_rows(rqs, isolated and independent)
     pairs = [(r["question"], list(r["options"])) for r in flat]
     rows = [[p] for p in pairs] if independent else [pairs]
-    items, ctx_len = build_rows(tok, ctx, rows, max_ctx_tokens=max_state_tokens, chat=chat)
+    items, ctx_len = build_rows(tok, ctx, rows, max_ctx_tokens=max_state_tokens, chat=chat, reject_overflow=reject_overflow)
     return rqs, index, items, ctx_len
 
 
 def _prepare_s1(state, questions, independent):
-    return prepare(eng.tok, state, questions, independent, ISOLATED, MAX_STATE_TOKENS, chat=CHAT)
+    try:
+        return prepare(eng.tok, state, questions, independent, ISOLATED, MAX_STATE_TOKENS, chat=CHAT,
+                       reject_overflow=REJECT_TRUNCATION)
+    except ContextTooLong as e:
+        stats["rejected_too_large"] += 1
+        raise HTTPException(413, str(e)) from e
 
 
 def _prepare_decide(context, schema):
@@ -244,13 +253,20 @@ async def batcher():
     while True:
         batch = await _collect(queue, BATCH_WAIT_MS, extra)
         extra = adaptive_ms(batch)
-        groups = plan_batches([len(it["ids"]) for _, it, _ in batch], eng.pad_len, eng.max_rows, MAX_BATCH,
-                              MERGE_OVERHEAD_TOKENS, _bucketed)
+        try:
+            groups = plan_batches([len(it["ids"]) for _, it, _ in batch], eng.pad_len, eng.max_rows, MAX_BATCH,
+                                  MERGE_OVERHEAD_TOKENS, _bucketed)
+        except Exception as e:
+            for fut, _, _ in batch:
+                if not fut.done(): fut.set_exception(e)
+            continue
         for T, idx in groups:
             part = [batch[i] for i in idx]
             stats["bucket_hist"][T] = stats["bucket_hist"].get(T, 0) + len(part)
             try:
                 probs = await loop.run_in_executor(gpu, _score_items, [it for _, it, _ in part])
+                if len(probs) != len(part):
+                    raise RuntimeError("engine returned an incomplete batch")
                 for (fut, _, _), p in zip(part, probs):
                     if not fut.done(): fut.set_result(p)
             except Exception as e:
@@ -281,6 +297,12 @@ def _plan_schema(questions, independent, state):
     else:
         qs = [_SQ(x["question"], list(x["options"])) for x in rows]
         tps = [len(schema_prefix_ids(eng.tok, g, chat=CHAT)) for g in ([[q] for q in qs] if independent else [qs])]
+    if REJECT_TRUNCATION:
+        try:
+            context_ids(eng.tok, S1.render_state(state), MAX_STATE_TOKENS, reject_overflow=True)
+        except ContextTooLong as e:
+            stats["rejected_too_large"] += 1
+            raise HTTPException(413, str(e)) from e
     row = schema_suffix_ids(eng.tok, S1.render_state(state), 1 if independent else len(rows), MAX_STATE_TOKENS, chat=CHAT)
     return tps, row
 
@@ -316,13 +338,20 @@ async def schema_batcher():
     while True:
         batch = await _collect(squeue)
         groups = {}
-        for fut, h, row in batch: groups.setdefault((h.id, se.bucket(len(row[0]))), (h, []))[1].append((fut, row))
+        try:
+            for fut, h, row in batch: groups.setdefault((h.id, se.bucket(len(row[0]))), (h, []))[1].append((fut, row))
+        except Exception as e:
+            for fut, _, _ in batch:
+                if not fut.done(): fut.set_exception(e)
+            continue
         for h, items in groups.values():
             step = max(1, MAX_BATCH // h.P)
             for i in range(0, len(items), step):
                 chunk = items[i:i + step]
                 try:
                     probs = await loop.run_in_executor(gpu, _score_schema, h, [c for _, c in chunk])
+                    if len(probs) != len(chunk):
+                        raise RuntimeError("schema engine returned an incomplete batch")
                     for (fut, _), p in zip(chunk, probs):
                         if not fut.done(): fut.set_result(p)
                 except Exception as e:
@@ -379,16 +408,18 @@ def resolve_device(requested=None):
     return dev, (torch.float16 if dev.startswith("mps") else torch.bfloat16)
 
 
-async def _start():
-    global eng, se, gpu, CHAT
+def _load_engine():
+    """Create, warm and seal every GPU object on the inference executor's sole owner thread."""
+    global eng, se, CHAT, cuda_ready
+    import torch
     from decider.engine_v2 import EngineV2
     apply_config(load_config(MODEL))
-    gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
-    loop = asyncio.get_running_loop()
     dev, dtype = resolve_device()
-    eng = await loop.run_in_executor(gpu, lambda: EngineV2(
+    if dev.startswith("cuda"):
+        torch.cuda.set_device(torch.device(dev).index or 0)
+    eng = EngineV2(
         MODEL, device=dev, dtype=dtype, compile=COMPILE, fp8=FP8, max_ctx_tokens=MAX_STATE_TOKENS, t_buckets=_ints("DECIDER_T_BUCKETS"),
-        b_buckets=_ints("DECIDER_B_BUCKETS"), token_budget=GRAPH_TOKEN_BUDGET))
+        b_buckets=_ints("DECIDER_B_BUCKETS"), token_budget=GRAPH_TOKEN_BUDGET)
     CHAT = chat_template(eng.tok) if LAYOUT == "chat" else None
     print("[serve] engine", dict({k: v for k, v in eng.cfg.items() if k not in ("t_buckets", "b_buckets")}, device=dev, layout=LAYOUT), flush=True)
     if SCHEMA_FIRST:
@@ -396,22 +427,34 @@ async def _start():
         se = SchemaEngine(eng, chat=CHAT); print("[serve] schema cache on", flush=True)
         pre = os.environ.get("DECIDER_SCHEMAS")      # JSON: [{"questions": {...}, "independent": true, "batch_sizes": [1, 8, 32], "state_tokens": [64, 256]}]
         for spec in (json.load(open(pre)) if pre else []):
-            _, h, _ = await loop.run_in_executor(gpu, _schema_handle, spec["questions"], spec.get("independent", True), COMPILE)
-            t = await loop.run_in_executor(gpu, se.warmup, h, spec.get("batch_sizes", (1, 8, 32)), spec.get("state_tokens", (64, 128, 256)))
+            _, h, _ = _schema_handle(spec["questions"], spec.get("independent", True), COMPILE)
+            t = se.warmup(h, spec.get("batch_sizes", (1, 8, 32)), spec.get("state_tokens", (64, 128, 256)))
             print(f"[serve] preloaded schema with {h.nq} rows, prefix {sum(h.tps)} tokens, graphs ready in {t:.0f}s", flush=True)
     if WARMUP and eng.use_graphs:                   # off CUDA there are no graphs to capture; every request runs eager
-        t = await loop.run_in_executor(gpu, lambda: eng.warmup(log=lambda s: print(s, flush=True)))
+        t = eng.warmup(log=lambda s: print(s, flush=True))
         print(f"[serve] captured {len(eng.graphs)} graphs in {t:.0f}s", flush=True)
     eng.seal()
-    print("[serve] ready", json.dumps(dict(model=MODEL_NAME, layout=LAYOUT, temperature=TEMP, isolated_levels=ISOLATED, schema_first=SCHEMA_FIRST,
-                                          shared=SHARED, graphs=len(eng.graphs), limits=dict(
-                                              max_rows=MAX_ROWS, max_row_tokens=MAX_ROW_TOKENS, max_request_tokens=MAX_REQUEST_TOKENS,
-                                              max_queue_rows=MAX_QUEUE_ROWS))), flush=True)
+    if dev.startswith("cuda") and WARMUP:
+        torch.cuda.synchronize(dev)
+        cuda_ready = True
+
+
+async def _start():
+    global gpu, cuda_ready
+    cuda_ready = False
+    gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(gpu, _load_engine)
     start_workers(loop)
+    print("[serve] ready", json.dumps(dict(model=MODEL_NAME, layout=LAYOUT, cuda_ready=cuda_ready,
+                                          graphs=len(eng.graphs), max_queue_rows=MAX_QUEUE_ROWS)), flush=True)
 
 
 def _stop():
-    global gpu, cpu, batcher_task, schema_task
+    global gpu, cpu, batcher_task, schema_task, cuda_ready
+    cuda_ready = False
+    for task in pending_requests:
+        task.cancel()
     for t in (batcher_task, schema_task):
         if t is not None: t.cancel()
     for ex in (gpu, cpu):
@@ -421,9 +464,11 @@ def _stop():
 
 @asynccontextmanager
 async def lifespan(app):
-    await _start()
-    yield
-    _stop()
+    try:
+        await _start()
+        yield
+    finally:
+        _stop()
 
 
 app = FastAPI(title="decider", lifespan=lifespan)
@@ -458,11 +503,36 @@ async def _queued(items):
     REQ_SEQ += 1; rid = REQ_SEQ
     for it in items:
         f = loop.create_future(); futs.append(f); queue.put_nowait((f, it, rid))
-    return await asyncio.gather(*futs)
+    results = await asyncio.gather(*futs, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
+async def _bounded_request(fn, request):
+    """Bound work before submitting tokenization; disconnects cannot free a still-running GPU reservation."""
+    if not _alive():
+        raise HTTPException(503, "inference workers are not ready")
+    if len(pending_requests) >= MAX_PENDING_REQUESTS:
+        stats["rejected_overloaded"] += 1
+        raise HTTPException(503, "server busy: DECIDER_MAX_PENDING_REQUESTS reached; retry later")
+    task = asyncio.create_task(fn(request))
+    pending_requests.add(task)
+    def finished(done):
+        pending_requests.discard(done)
+        if not done.cancelled():
+            done.exception()                      # retrieve errors even when the HTTP caller disconnected
+    task.add_done_callback(finished)
+    return await asyncio.shield(task)
 
 
 @app.post("/decide")
 async def decide(r: Req):
+    return await _bounded_request(_decide, r)
+
+
+async def _decide(r):
     loop = asyncio.get_running_loop()
     try:
         qs, it = await loop.run_in_executor(cpu, _prepare_decide, r.context, r.schema_)
@@ -485,6 +555,10 @@ async def decide(r: Req):
 
 @app.post("/v1/systemone")
 async def systemone(r: S1Req):
+    return await _bounded_request(_systemone, r)
+
+
+async def _systemone(r):
     loop = asyncio.get_running_loop()
     if SCHEMA_FIRST and r.questions and r.layout != "state_first" and _worth_caching(r.questions, r.independent):
         try:                                       # CPU: rows, prefix lengths, suffix ids -> the complete cost before any GPU work
@@ -534,8 +608,11 @@ async def models():
 
 @app.get("/health")
 async def health():
-    return {"ok": eng is not None and bool(getattr(eng, "sealed", True)) and _alive(), "model": MODEL,
-            "device": str(getattr(eng, "dev", "")) if eng is not None else None, "layout": LAYOUT}
+    device = str(getattr(eng, "dev", "")) if eng is not None else None
+    ok = eng is not None and bool(getattr(eng, "sealed", True)) and _alive()
+    if device and device.startswith("cuda"):
+        ok = ok and cuda_ready
+    return {"ok": ok, "model": MODEL, "device": device, "layout": LAYOUT, "cuda_ready": bool(ok and cuda_ready)}
 
 
 @app.get("/stats")

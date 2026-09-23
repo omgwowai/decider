@@ -9,3 +9,6 @@ __pycache__/
 .nfs*
 dist/
 build/
+/.cache/
+/hf/
+*.log
