@@ -86,7 +86,7 @@ def test_assemble_shape_is_unchanged(tok):
 
 
 def test_bad_questions_raise_value_error(tok):
-    for bad in ({"q": {"type": "choice", "instructions": "x", "criteria": ["only one"]}},
+    for bad in ({"q": {"type": "choice", "instructions": "x", "criteria": []}},
                 {"q": {"type": "score", "instructions": "x", "criteria": list(range(20))}},
                 {"q": {"type": "nope", "instructions": "x"}},
                 {"q": {"type": "choice", "criteria": ["a", "b"]}}):

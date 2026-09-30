@@ -60,6 +60,17 @@ Other options: `--venv`, `--cache-dir`, `--host`, `--device cuda:0`, `--max-batc
 stopped or modified. Inherited `DECIDER_*` experiment settings are cleared for the launched service;
 the current checkout is selected explicitly, and model loading after download is offline.
 
+On Windows PyTorch builds without fused Flash/GQA attention, large requests can fall
+back to quadratic-memory math attention. `--expanded-sdpa` opts this model into
+equivalent expanded KV heads, allowing the existing memory-efficient SDPA kernel;
+it does not change candidates, weights, masks, or the one-choice inference protocol.
+For a resident 0.8B service handling full Sims candidate lists, use
+`--expanded-sdpa --token-budget 32768 --graph-max-tokens 8192 --max-batch 1` in addition to the local-model
+command above. Check GPU headroom with the game running. The default remains 8192;
+larger budgets still require real GPU validation. cuDNN attention stays disabled.
+The graph cap limits resident pre-captured lengths, not input: longer complete rows
+use the existing eager forward, with no candidate splitting or additional decision.
+
 ```sh
 curl http://127.0.0.1:8102/health
 ```
@@ -77,6 +88,8 @@ The scaffold uses `POST /v1/systemone` with the official envelope:
 ```
 
 `state` is a compact JSON **string**, not a flattened feature summary. Criteria retain insertion order.
+Choice questions accept 1 through 255 criteria. A singleton still goes through one
+model scoring row and returns its only label; the client does not bypass inference.
 Responses remain `{model, answers, usage}`. This deployment enables `DECIDER_REJECT_TRUNCATION=1`:
 oversized states/rows/requests fail with HTTP 413 rather than silently losing state. The token budget
 limits total request scoring tokens and padded microbatches. Shared-prefix and schema-cache opt-ins

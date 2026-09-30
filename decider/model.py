@@ -1,4 +1,5 @@
 """Backbone -> slot hidden states -> restricted logits over option letters."""
+import os
 import torch, torch.nn as nn, torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from decider.prompt import letter_ids, MAX_OPTIONS
@@ -11,6 +12,9 @@ class DecisionModel(nn.Module):
             torch.backends.cuda.enable_cudnn_sdp(False)         # backend is wrong for masked attention on Blackwell (torch 2.14)
         self.tok = AutoTokenizer.from_pretrained(name)
         self.lm = AutoModelForCausalLM.from_pretrained(name, dtype=dtype)
+        if os.environ.get("DECIDER_EXPANDED_SDPA", "0") == "1":
+            from decider.sdpa_compat import enable_expanded_sdpa
+            enable_expanded_sdpa(self.lm)
         if grad_ckpt:
             self.lm.gradient_checkpointing_enable()
         self.register_buffer("letters", torch.tensor(letter_ids(self.tok)), persistent=False)

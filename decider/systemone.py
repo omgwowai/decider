@@ -44,8 +44,8 @@ def render_question(spec):
     if t == "choice":
         if isinstance(crit, (list, tuple)):
             crit = {str(c): None for c in crit}
-        if not isinstance(crit, dict) or not 2 <= len(crit) <= MAX_CHOICE:
-            raise ValueError(f"choice criteria: a map of 2..{MAX_CHOICE} options")
+        if not isinstance(crit, dict) or not 1 <= len(crit) <= MAX_CHOICE:
+            raise ValueError(f"choice criteria: a map of 1..{MAX_CHOICE} options")
         names = list(crit); opts = [n if crit[n] in (None, "") else f"{n}: {_txt(crit[n])}" for n in names]
     elif t == "score":
         if isinstance(crit, dict):                                   # legend form {"0": "...", "1": "..."}

@@ -29,6 +29,10 @@ def parse_args(argv=None):
     p.add_argument("--max-batch", type=int, default=8)
     p.add_argument("--batch-wait-ms", type=float, default=0)
     p.add_argument("--token-budget", type=int, default=8192)
+    p.add_argument("--graph-max-tokens", type=int,
+                   help="cap resident CUDA graph lengths; longer complete rows run eagerly")
+    p.add_argument("--expanded-sdpa", action="store_true",
+                   help="expand KV heads to enable memory-efficient SDPA on builds without fused GQA")
     p.add_argument("--max-pending", type=int, default=64)
     p.add_argument("--runtime", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
@@ -38,6 +42,8 @@ def parse_args(argv=None):
         p.error("--port must be in 1..65535")
     if min(args.max_batch, args.token_budget, args.max_pending) < 1 or not 0 <= args.batch_wait_ms < float("inf"):
         p.error("batch size, token budget and pending limit must be positive; wait must be finite and nonnegative")
+    if args.graph_max_tokens is not None and not 1 <= args.graph_max_tokens <= args.token_budget:
+        p.error("--graph-max-tokens must be positive and no greater than --token-budget")
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         p.error("this deployment requires an NVIDIA CUDA device, e.g. cuda:0; there is no CPU fallback")
     if not args.local_model:
@@ -123,8 +129,9 @@ def server_environment(args, model):
     for key in list(env):
         if key.startswith("DECIDER_"):
             del env[key]
+    graph_max = args.graph_max_tokens or args.token_budget
     lengths = [n for n in (64, 128, 192, 256, 320, 384, 512, 640, 768, 1024, 1280, 1536, 2048, 3072, 4096, 6144, 8192)
-               if n < args.token_budget] + [args.token_budget]
+               if n < graph_max] + [graph_max]
     env.update(PYTHONPATH=str(ROOT), PYTHONNOUSERSITE="1", PYTHONUNBUFFERED="1",
                TOKENIZERS_PARALLELISM="false", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                DECIDER_MODEL=str(model), DECIDER_DEVICE=args.device, DECIDER_WARMUP="1",
@@ -133,6 +140,7 @@ def server_environment(args, model):
                DECIDER_MAX_PENDING_REQUESTS=str(args.max_pending), DECIDER_MAX_QUEUE_ROWS=str(args.max_pending * args.max_batch),
                DECIDER_MAX_STATE_TOKENS=str(args.token_budget), DECIDER_MAX_ROW_TOKENS=str(args.token_budget),
                DECIDER_MAX_REQUEST_TOKENS=str(args.token_budget), DECIDER_REJECT_TRUNCATION="1",
+               DECIDER_EXPANDED_SDPA="1" if args.expanded_sdpa else "0",
                DECIDER_SHARED="0", DECIDER_SCHEMA_CACHE="0",
                DECIDER_B_BUCKETS=",".join(str(n) for n in (1, 2, 4, 8, 16, 32) if n <= args.max_batch),
                DECIDER_T_BUCKETS=",".join(map(str, lengths)))

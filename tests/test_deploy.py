@@ -78,6 +78,29 @@ def test_deployment_environment_is_strict_and_source_is_local(monkeypatch, tmp_p
     assert env["DECIDER_BATCH_ADAPTIVE_WAIT_MS"] == "0"
     assert env["DECIDER_MAX_PENDING_REQUESTS"] == "64"
     assert "DECIDER_FP8" not in env
+    assert env["DECIDER_EXPANDED_SDPA"] == "0"
+
+
+def test_expanded_sdpa_is_explicit_and_keeps_full_request_budget(tmp_path):
+    args = deploy.parse_args(["--expanded-sdpa", "--token-budget", "32768", "--max-batch", "1"])
+    env = deploy.server_environment(args, tmp_path)
+    assert env["DECIDER_EXPANDED_SDPA"] == "1"
+    assert env["DECIDER_REJECT_TRUNCATION"] == "1"
+    assert env["DECIDER_MAX_ROW_TOKENS"] == env["DECIDER_MAX_REQUEST_TOKENS"] == "32768"
+
+
+def test_graph_memory_cap_does_not_reduce_input_capacity(tmp_path):
+    args = deploy.parse_args(["--token-budget", "32768", "--graph-max-tokens", "8192"])
+    env = deploy.server_environment(args, tmp_path)
+    assert max(map(int, env["DECIDER_T_BUCKETS"].split(","))) == 8192
+    assert env["DECIDER_MAX_ROW_TOKENS"] == env["DECIDER_MAX_REQUEST_TOKENS"] == "32768"
+    assert env["DECIDER_REJECT_TRUNCATION"] == "1"
+
+
+@pytest.mark.parametrize("value", ["0", "8193"])
+def test_invalid_graph_cap_is_rejected(value):
+    with pytest.raises(SystemExit):
+        deploy.parse_args(["--graph-max-tokens", value])
 
 
 def test_cpu_preflight_fails_instead_of_falling_back(monkeypatch):

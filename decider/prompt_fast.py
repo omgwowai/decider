@@ -71,8 +71,8 @@ def build_rows(tok, context, rows, max_ctx_tokens=32768, chat=None, reject_overf
         multi = len(row) > 1
         ids = list(ctx); slots = []; nopts = []
         for k, (text, options) in enumerate(row):
-            if not 2 <= len(options) <= MAX_OPTIONS:
-                raise ValueError(f"2..{MAX_OPTIONS} options required")
+            if not 1 <= len(options) <= MAX_OPTIONS:
+                raise ValueError(f"1..{MAX_OPTIONS} options required")
             if chat is None:
                 ids.extend(question_piece(tok, text, options, k, multi))
                 slots.append(len(ids) - 1)

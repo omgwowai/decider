@@ -137,9 +137,21 @@ def test_invalid_question_is_422_with_detail(served):
     eng, run = served
 
     async def fn(cl):
-        return await cl.post("/v1/systemone", json={"state": "s", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": ["one"]}}})
+        return await cl.post("/v1/systemone", json={"state": "s", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": []}}})
     r = run(fn)
-    assert r.status_code == 422 and r.json() == {"detail": "choice criteria: a map of 2..255 options"}
+    assert r.status_code == 422 and r.json() == {"detail": "choice criteria: a map of 1..255 options"}
+
+
+def test_singleton_is_scored_once(served):
+    eng, run = served
+    async def fn(cl):
+        return await cl.post("/v1/systemone", json={"state": "s", "questions": {
+            "q": {"type": "choice", "instructions": "choose", "criteria": {"c000": "one"}}}})
+    r = run(fn)
+    assert r.status_code == 200
+    assert r.json()["answers"]["q"]["choice"] == "c000"
+    assert r.json()["usage"]["input_tokens"] > 0
+    assert eng.calls == [("items", 1)]
 
 
 def test_shared_path_is_used_for_long_multi_question_states(served, monkeypatch):
@@ -231,7 +243,7 @@ def test_bytes_match_the_1_0_server(served, monkeypatch):
               {"state": "x" * 400, "questions": QUESTIONS},                                    # shared path in both
               {"state": {"ticket": {"body": "y" * 300}, "rows": [{"v": i} for i in range(12)]}, "questions": QUESTIONS, "independent": False},
               {"state": "hello", "questions": {}},
-              {"state": "s", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": ["one"]}}},
+              {"state": "s", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": []}}},
               {"questions": QUESTIONS}]
     decide = {"context": "my card was charged twice",
               "schema": {"Which team?": {"type": "choice", "options": ["billing", "technical", "none"]}, "Urgent?": {"type": "bool"}}}

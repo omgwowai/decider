@@ -15,11 +15,20 @@ def test_choice_with_descriptions_json_rubrics_and_null():
 def test_choice_accepts_a_plain_list_and_rejects_bad_sizes():
     assert s1.render_question({"type": "choice", "instructions": "q", "criteria": ["a", "b"]})["names"] == ["a", "b"]
     with pytest.raises(ValueError):
-        s1.render_question({"type": "choice", "instructions": "q", "criteria": {"only": None}})
+        s1.render_question({"type": "choice", "instructions": "q", "criteria": {}})
     with pytest.raises(ValueError):
         s1.render_question({"type": "choice", "instructions": "q", "criteria": {str(i): None for i in range(256)}})
     with pytest.raises(ValueError):
         s1.render_question({"type": "choice", "criteria": {"a": None, "b": None}})     # no instructions
+
+
+def test_single_choice_preserves_one_scoring_row_and_exact_identity():
+    rq = s1.render_question({"type": "choice", "instructions": "Select this offered action",
+                             "criteria": {"c000": "Move to the kitchen"}})
+    rows, index = s1.plan_rows({"selection": rq})
+    assert len(rows) == 1 and rows[0]["options"] == ["c000: Move to the kitchen"]
+    answer = s1.assemble({"selection": rq}, index, [[1.0]])["selection"]
+    assert answer["choice"] == "c000" and answer["probabilities"] == {"c000": 1.0}
 
 
 def test_score_levels_list_or_legend_map():

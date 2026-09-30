@@ -32,7 +32,8 @@ def _reference(tok, ctx, rows, max_ctx_tokens=32768):
 
 def _cases():
     rng = random.Random(7)
-    out = [("short state", "a customer wants a refund", [[("Which queue?", ["billing", "technical", "sales"])]]),
+    out = [("singleton", "one available action", [[("Which?", ["only action"])]]),
+           ("short state", "a customer wants a refund", [[("Which queue?", ["billing", "technical", "sales"])]]),
            ("empty-ish state", "", [[("Yes or no?", ["no", "yes"])]]),
            ("unicode state", "árvíztűrő tükörfúrógép 🙂\n\nline two", [[("Which?", ["a", "b"])]]),
            ("json state", json.dumps({"a": [1, 2, 3], "b": "x" * 300}), [[("Which?", ["one", "two", "three"])]])]
