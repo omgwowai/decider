@@ -7,6 +7,11 @@ Newest first. Every entry names the weights it applies to; the Hub repositories 
 
 Code-only changes for `omgwowai/decider`; published model weights are unchanged.
 
+- 1.3.0: default deployment and HTTP serving to pinned StartLux-Decision-0.8B; retain explicit Mapika selection.
+- Vendor the unchanged Apache-2.0 StartLux prompt/inference source with its notice; document the separate non-commercial weight license.
+- Add numerically validated Windows CUDA kernels, readiness self-checks and bounded integration into the existing HTTP application, including client `certainty` compatibility.
+- Preserve complete input and candidate probabilities, official per-type temperatures and wide-choice rounds; retain reservations across disconnects and errors.
+
 - Add an isolated NVIDIA deployment launcher for the scaffold submodule. Install this checkout, pin the default 0.8B checkpoint revision, verify CUDA execution, and expose the official System One API on loopback port 8102.
 - Keep model construction, graph warmup, synchronization and scoring on one GPU owner thread; report CUDA readiness only after startup completes.
 - Bound pending requests before tokenization and preserve reservations until accepted work settles, including disconnected clients and failed batches.

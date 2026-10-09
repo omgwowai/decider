@@ -27,7 +27,10 @@ def test_download_uses_immutable_revision_and_local_model_never_downloads(tmp_pa
     monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=download))
     args = deploy.parse_args(["--cache-dir", str(tmp_path / "cache")])
     assert deploy.resolve_model(args) == model
-    assert calls == [{"repo_id": deploy.MODEL, "revision": deploy.REVISION, "cache_dir": str(args.cache_dir)}]
+    assert len(calls) == 1
+    assert {key: calls[0][key] for key in ("repo_id", "revision", "cache_dir")} == {
+        "repo_id": deploy.MODEL, "revision": deploy.REVISION, "cache_dir": str(args.cache_dir)}
+    assert "*.safetensors" in calls[0]["allow_patterns"] and "*.py" not in calls[0]["allow_patterns"]
     assert deploy.resolve_model(deploy.parse_args(["--local-model", str(model)])) == model
     assert len(calls) == 1
 
@@ -109,3 +112,26 @@ def test_custom_token_budget_never_pads_past_limit(budget, tmp_path):
     assert max(lengths) == budget
     assert int(env["DECIDER_MAX_ROW_TOKENS"]) == budget
     assert int(env["DECIDER_GRAPH_TOKEN_BUDGET"]) == budget
+
+
+def test_startlux_is_the_pinned_default_and_local_checkpoint_is_supported(tmp_path):
+    args = deploy.parse_args([])
+    assert args.model == "startlux-models/StartLux-Decision-0.8B"
+    assert args.revision == "bd4f76a600e23227547fee7bfc1825e12a32764c"
+    model = checkpoint(tmp_path / "startlux")
+    (model / "decider_config.json").rename(model / "decision_config.json")
+    assert deploy.resolve_model(deploy.parse_args(["--local-model", str(model)])) == model
+    (model / "decider_config.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        deploy.resolve_model(deploy.parse_args(["--local-model", str(model)]))
+
+
+def test_startlux_deployment_cannot_inherit_disabled_graphs_or_slow_bypass(tmp_path, monkeypatch):
+    monkeypatch.setenv("STARTLUX_ALLOW_SLOW", "1")
+    monkeypatch.setenv("STARTLUX_GRAPHS", "0")
+    model = checkpoint(tmp_path / "startlux")
+    (model / "decider_config.json").rename(model / "decision_config.json")
+    env = deploy.server_environment(deploy.parse_args([]), model)
+    assert "STARTLUX_ALLOW_SLOW" not in env and "STARTLUX_GRAPHS" not in env
+    if deploy.os.name == "nt":
+        assert env["TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER"] == "0"

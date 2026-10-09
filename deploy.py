@@ -6,10 +6,9 @@ import re
 import shutil
 import subprocess
 import sys
+from decider.startlux import MODEL, REVISION, configure_environment, is_startlux
 
 ROOT = Path(__file__).resolve().parent
-MODEL = "Mapika/decider-0.8b"
-REVISION = "a0a01d6f8135298f400a8c856b355793012ae971"
 TORCH = "torch==2.8.0"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 
@@ -109,9 +108,12 @@ def resolve_model(args):
         path = args.local_model
     else:
         from huggingface_hub import snapshot_download
-        path = Path(snapshot_download(repo_id=args.model, revision=args.revision, cache_dir=str(args.cache_dir)))
-    if not path.is_dir() or not (path / "config.json").is_file() or not (path / "decider_config.json").is_file():
-        raise RuntimeError(f"Incomplete model folder: {path}; config.json and decider_config.json are required")
+        path = Path(snapshot_download(repo_id=args.model, revision=args.revision, cache_dir=str(args.cache_dir),
+                    allow_patterns=["*.json", "*.safetensors", "*.jinja", "tokenizer*", "vocab*", "merges*", "LICENSE", "NOTICE"]))
+    configs = [name for name in ("decider_config.json", "decision_config.json") if (path / name).is_file()]
+    if not path.is_dir() or not (path / "config.json").is_file() or len(configs) != 1:
+        raise RuntimeError(f"Incomplete or ambiguous model folder: {path}; config.json and exactly one of "
+                           "decider_config.json / decision_config.json are required")
     if not any(path.glob("*.safetensors")):
         raise RuntimeError(f"No safetensors weights in {path}; provide a complete Decider checkpoint")
     return path.resolve()
@@ -123,6 +125,10 @@ def server_environment(args, model):
     for key in list(env):
         if key.startswith("DECIDER_"):
             del env[key]
+    for key in ("STARTLUX_ALLOW_SLOW", "STARTLUX_GRAPHS"):
+        env.pop(key, None)
+    if is_startlux(model):
+        configure_environment(env)
     lengths = [n for n in (64, 128, 192, 256, 320, 384, 512, 640, 768, 1024, 1280, 1536, 2048, 3072, 4096, 6144, 8192)
                if n < args.token_budget] + [args.token_budget]
     env.update(PYTHONPATH=str(ROOT), PYTHONNOUSERSITE="1", PYTHONUNBUFFERED="1",

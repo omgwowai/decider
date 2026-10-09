@@ -50,13 +50,14 @@ from decider import systemone as S1
 from decider.batching import DEFAULT_MERGE_OVERHEAD_TOKENS, plan_batches
 from decider.prompt import build, MAX_OPTIONS, resolve_layout, chat_template
 from decider.prompt_fast import build_rows, unique_tokens, context_ids, ContextTooLong
+from decider.startlux import MODEL as STARTLUX_MODEL, REVISION as STARTLUX_REVISION, is_startlux, configure_environment
 
 
 def _env_int(name, default):
     return int(os.environ.get(name, default))
 
 
-MODEL = os.environ.get("DECIDER_MODEL", "runs/r3_v2/model")
+MODEL = os.environ.get("DECIDER_MODEL", STARTLUX_MODEL)
 MAX_BATCH = _env_int("DECIDER_MAX_BATCH", 32)
 BATCH_WAIT_MS = float(os.environ.get("DECIDER_BATCH_WAIT_MS", os.environ.get("DECIDER_MAX_WAIT_MS", "0")))
 ADAPTIVE_WAIT_MS = float(os.environ.get("DECIDER_BATCH_ADAPTIVE_WAIT_MS", "2"))   # window after a collection that held >1 request; 0 disables
@@ -86,6 +87,7 @@ eng = None; queue = None; gpu = None; cpu = None; batcher_task = None; schema_ta
 outstanding = 0; REQ_SEQ = 0
 pending_requests = set()
 cuda_ready = False
+STARTLUX = False
 stats = dict(requests=0, batches=0, decisions=0, rows=0, shared_prefix_requests=0, errors=0, rejected_too_large=0,
              rejected_overloaded=0, batch_hist={}, bucket_hist={})
 
@@ -410,7 +412,24 @@ def resolve_device(requested=None):
 
 def _load_engine():
     """Create, warm and seal every GPU object on the inference executor's sole owner thread."""
-    global eng, se, CHAT, cuda_ready
+    global eng, se, CHAT, cuda_ready, STARTLUX, MODEL_NAME, LAYOUT, SCHEMA_FIRST
+    path = MODEL
+    if MODEL == STARTLUX_MODEL:
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(repo_id=MODEL, revision=STARTLUX_REVISION,
+                                 allow_patterns=["*.json", "*.safetensors", "*.jinja", "tokenizer*", "vocab*", "merges*", "LICENSE", "NOTICE"])
+    STARTLUX = is_startlux(path)
+    if STARTLUX:
+        if not WARMUP or FP8 or COMPILE or os.environ.get("DECIDER_SCHEMA_CACHE", "0") == "1":
+            raise ValueError("StartLux requires warmup; FP8, model-wide compile and schema-cache modes are unsupported")
+        configure_environment(os.environ)
+        from decider.startlux import StartLuxEngine
+        dev, _ = resolve_device()
+        eng = StartLuxEngine(path, dev, MAX_STATE_TOKENS, MAX_ROW_TOKENS, GRAPH_TOKEN_BUDGET)
+        MODEL_NAME, LAYOUT, SCHEMA_FIRST, CHAT = STARTLUX_MODEL, "startlux", False, None
+        cuda_ready = True
+        print("[serve] StartLux kernels", json.dumps(eng.kernel_report), flush=True)
+        return
     import torch
     from decider.engine_v2 import EngineV2
     apply_config(load_config(MODEL))
@@ -533,6 +552,20 @@ async def decide(r: Req):
 
 
 async def _decide(r):
+    if STARTLUX:
+        from decider.infer import Decider
+        import numpy as np
+        try:
+            qs = Decider._schema_to_questions(r.schema_)
+        except (ValueError, KeyError) as e:
+            raise HTTPException(422, str(e)) from e
+        questions = {str(i): {"type": "choice", "instructions": q["question"],
+                             "criteria": {str(j): option for j, option in enumerate(q["options"])}}
+                     for i, q in enumerate(qs)}
+        reply = await _startlux_systemone(S1Req(state=r.context, questions=questions))
+        probs = [np.asarray([reply["answers"][str(i)]["probabilities"][str(j)]
+                             for j in range(len(q["options"]))]) for i, q in enumerate(qs)]
+        return _format_decide(r.schema_, qs, probs)
     loop = asyncio.get_running_loop()
     try:
         qs, it = await loop.run_in_executor(cpu, _prepare_decide, r.context, r.schema_)
@@ -558,7 +591,37 @@ async def systemone(r: S1Req):
     return await _bounded_request(_systemone, r)
 
 
+async def _startlux_systemone(r):
+    from decider.startlux import StateTooLong
+    if not r.independent or r.layout not in (None, "state_first"):
+        raise HTTPException(422, "StartLux uses independent questions with its official prompt layout")
+    loop = asyncio.get_running_loop()
+    try:
+        prepared = await loop.run_in_executor(cpu, eng.prepare, r.state, r.questions)
+    except StateTooLong as e:
+        stats["rejected_too_large"] += 1
+        raise HTTPException(413, str(e)) from e
+    except (ValueError, TypeError, KeyError) as e:
+        stats["errors"] += 1
+        raise HTTPException(422, str(e)) from e
+    check_size(prepared.lengths, max_row_tokens=min(MAX_ROW_TOKENS, getattr(eng, "max_row_tokens", MAX_ROW_TOKENS)))
+    _admit(len(prepared.lengths))
+    try:
+        answers, usage = await loop.run_in_executor(gpu, eng.decide, prepared)
+    except Exception:
+        stats["errors"] += 1
+        raise
+    finally:
+        _release(len(prepared.lengths))
+    stats["requests"] += 1
+    stats["decisions"] += len(r.questions)
+    stats["rows"] += len(prepared.lengths)
+    return {"model": MODEL_NAME, "answers": answers, "usage": usage}
+
+
 async def _systemone(r):
+    if STARTLUX:
+        return await _startlux_systemone(r)
     loop = asyncio.get_running_loop()
     if SCHEMA_FIRST and r.questions and r.layout != "state_first" and _worth_caching(r.questions, r.independent):
         try:                                       # CPU: rows, prefix lengths, suffix ids -> the complete cost before any GPU work
@@ -612,7 +675,11 @@ async def health():
     ok = eng is not None and bool(getattr(eng, "sealed", True)) and _alive()
     if device and device.startswith("cuda"):
         ok = ok and cuda_ready
-    return {"ok": ok, "model": MODEL, "device": device, "layout": LAYOUT, "cuda_ready": bool(ok and cuda_ready)}
+    result = {"ok": ok, "model": MODEL, "device": device, "layout": LAYOUT, "cuda_ready": bool(ok and cuda_ready)}
+    if STARTLUX and eng is not None:
+        result.update(backend="torch", kernel_backend=eng.kernel_report["backend"],
+                      fast_kernels=eng.kernel_report["validated"], cuda_graphs=len(eng.graphs), images=False)
+    return result
 
 
 @app.get("/stats")

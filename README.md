@@ -37,24 +37,37 @@ python services/decider/deploy.py
 ```
 
 The launcher creates `services/decider/.venv-deploy`, installs **this checkout** and its serving
-dependencies (not the public `decider-ai` release), downloads `Mapika/decider-0.8b` at immutable commit
-`a0a01d6f8135298f400a8c856b355793012ae971`, checks real CUDA bfloat16 execution, and runs the official
+dependencies (not the public `decider-ai` release), downloads `startlux-models/StartLux-Decision-0.8B` at immutable commit
+`bd4f76a600e23227547fee7bfc1825e12a32764c`, checks real CUDA bfloat16 execution, and runs the official
 `decider.serve:app` with one process on **127.0.0.1:8102**. Python 3.11 or 3.12 and a compatible NVIDIA
 driver are required for managed installation. It installs PyTorch 2.8 CUDA 12.8 wheels; Windows also
 installs `triton-windows` 3.4. FLA 0.5.2 avoids pulling the Linux-only Triton package on Windows.
 An installation/import/CUDA/warmup error aborts instead of silently using CPU. Initial graph warmup
 can take time and GPU memory; the launch banner alone is not evidence of readiness.
 
+The default StartLux backend preserves the upstream prompt, per-type temperatures, letter-logit
+readout, confidence and wide-choice algorithm. It adds Decider's entropy-based `certainty` field
+without changing probabilities. The existing `/v1/systemone`, `/decide`, `/health`, `/v1/models`
+and `/stats` routes remain available. Mapika checkpoints remain selectable explicitly.
+
+**License:** StartLux's inference code is Apache-2.0, vendored unchanged with its notice under
+`decider/_startlux/`. Its **weights are CC BY-NC 4.0**, not Apache-2.0: research/non-commercial use
+is permitted with attribution; commercial use requires a separate StartLux Labs license.
+No weights or code downloaded from a model repository are executed as Python by this adapter.
+
 To use an **existing compatible GPU Python without changing its packages**, explicitly opt out of installation:
 
 ```sh
-python services/decider/deploy.py --python /path/to/gpu/python --skip-install --local-model /path/to/decider-0.8b --port 8102
+python services/decider/deploy.py --python /path/to/gpu/python --skip-install --local-model /path/to/StartLux-Decision-0.8B --port 8102
 ```
 
 Windows accepts paths such as `--python D:/envs/gpu/Scripts/python.exe`. `--local-model` requires a
 complete checkpoint with configuration, tokenizer and safetensors files and does not download weights.
 Without it, weights use the dedicated ignored `.cache/huggingface` directory. Override `--model`
 only together with an immutable 40-character `--revision`; `main` and tags are rejected.
+StartLux checkpoints use `decision_config.json`; Mapika checkpoints use `decider_config.json`.
+Exactly one must be present alongside `config.json` and the safetensors weights.
+For the former default, pass `--model Mapika/decider-0.8b --revision a0a01d6f8135298f400a8c856b355793012ae971`.
 Other options: `--venv`, `--cache-dir`, `--host`, `--device cuda:0`, `--max-batch` (8),
 `--batch-wait-ms` (0), `--token-budget` (8192), and `--max-pending` (64). No 8100/8101 service is
 stopped or modified. Inherited `DECIDER_*` experiment settings are cleared for the launched service;
