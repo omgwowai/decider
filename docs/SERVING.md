@@ -38,6 +38,29 @@ The historical sections below describe the Mapika `EngineV2` path unless stated 
 - `/health` adds `backend`, `kernel_backend`, `fast_kernels`, `cuda_graphs` and `images`.
   Wait for both `ok=true` and `cuda_ready=true`; a process/launch banner is not readiness.
 
+## Local model switching
+
+`GET /v1/model-control` reports the cached, immutable StartLux 0.8B and Mapika 0.8B
+catalog, the confirmed active model, readiness and the current switch state. A custom
+local startup checkpoint remains selectable as `startup`; it is not relabeled as a
+verified Hub revision. `DECIDER_MODEL_CACHE` selects the cache (set by `deploy.py`
+from `--cache-dir`). Missing models are disabled: management requests never download
+weights or execute downloaded Python. Install the pinned checkpoint in that cache first.
+
+`POST /v1/model-control` with `{"model":"Mapika/decider-0.8b"}` accepts one switch
+at a time (202; concurrent switches return 409). This mutation requires loopback,
+same-origin JSON access. New inference requests receive 503 while existing accepted
+requests drain, including work whose HTTP client disconnected. The GPU owner then
+releases the old model and its kernel bindings, loads and warms the new model, and
+only then publishes readiness. A loading error attempts to restore the old model;
+if restoration also fails, no active model is reported. Poll status rather than
+treating an accepted request as a completed switch. A browser disconnect does not cancel it.
+
+Selection lasts for this serving process; restart uses the launch configuration.
+Switching can take substantial time and GPU memory during graph capture. It does not
+increase client deadlines or relax request limits. The OWHS WebUI proxies this API
+through `/ai/decider`; it does not own the GPU or change game control state.
+
 ## 1. Why
 
 The Decision Index (github.com/apolinario/decision-index) measured the 1.0.x server at a median of 50 ms and a p95 of

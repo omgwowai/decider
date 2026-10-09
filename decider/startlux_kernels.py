@@ -10,6 +10,21 @@ from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from decider.engine import fused_causal_conv1d_fn, set_attention_backend_policy
 
+_installed = None
+
+
+def restore():
+    """Undo only our bindings before another model family is loaded."""
+    global _installed
+    if _installed is None:
+        return
+    originals, bindings = _installed
+    if any(getattr(mq, name) is not function for name, function in bindings.items()):
+        raise RuntimeError('StartLux CUDA bindings changed outside their owner')
+    for name, function in originals.items():
+        setattr(mq, name, function)
+    _installed = None
+
 
 def load_model(path, device):
     config = AutoConfig.from_pretrained(path)
@@ -21,11 +36,14 @@ def load_model(path, device):
 
 
 def install(startlux_model):
+    global _installed
+    restore()
     if not torch.cuda.is_available():
         raise RuntimeError('Windows StartLux requires an actual CUDA device')
-    originals = {name: inspect.unwrap(getattr(mq, name)) for name in (
+    previous = {name: getattr(mq, name) for name in (
         'causal_conv1d_fn', 'causal_conv1d_update',
         'torch_chunk_gated_delta_rule', 'torch_recurrent_gated_delta_rule')}
+    originals = {name: inspect.unwrap(function) for name, function in previous.items()}
     set_attention_backend_policy()
     bindings = dict(
         causal_conv1d_fn=torch.compile(fused_causal_conv1d_fn, fullgraph=True, dynamic=True),
@@ -72,6 +90,7 @@ def install(startlux_model):
     # Publish only after actual CUDA execution and numerical comparisons succeed.
     for name, function in bindings.items():
         setattr(mq, name, function)
+    _installed = previous, bindings
 
     def fast_kernels_active(path):
         return (AutoConfig.from_pretrained(path).model_type == 'qwen3_5'

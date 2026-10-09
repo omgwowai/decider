@@ -134,6 +134,7 @@ def server_environment(args, model):
     env.update(PYTHONPATH=str(ROOT), PYTHONNOUSERSITE="1", PYTHONUNBUFFERED="1",
                TOKENIZERS_PARALLELISM="false", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                DECIDER_MODEL=str(model), DECIDER_DEVICE=args.device, DECIDER_WARMUP="1",
+               DECIDER_MODEL_CACHE=str(args.cache_dir),
                DECIDER_MAX_BATCH=str(args.max_batch), DECIDER_BATCH_WAIT_MS=str(args.batch_wait_ms),
                DECIDER_BATCH_ADAPTIVE_WAIT_MS="0", DECIDER_GRAPH_TOKEN_BUDGET=str(args.token_budget),
                DECIDER_MAX_PENDING_REQUESTS=str(args.max_pending), DECIDER_MAX_QUEUE_ROWS=str(args.max_pending * args.max_batch),

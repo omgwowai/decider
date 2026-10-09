@@ -11,6 +11,7 @@ Code-only changes for `omgwowai/decider`; published model weights are unchanged.
 - Vendor the unchanged Apache-2.0 StartLux prompt/inference source with its notice; document the separate non-commercial weight license.
 - Add numerically validated Windows CUDA kernels, readiness self-checks and bounded integration into the existing HTTP application, including client `certainty` compatibility.
 - Preserve complete input and candidate probabilities, official per-type temperatures and wide-choice rounds; retain reservations across disconnects and errors.
+- Add local-only model control for cached small models, drain-before-switch semantics, single-owner CUDA loading and explicit rollback/readiness reporting.
 
 - Add an isolated NVIDIA deployment launcher for the scaffold submodule. Install this checkout, pin the default 0.8B checkpoint revision, verify CUDA execution, and expose the official System One API on loopback port 8102.
 - Keep model construction, graph warmup, synchronization and scoring on one GPU owner thread; report CUDA readiness only after startup completes.
