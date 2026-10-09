@@ -1,8 +1,65 @@
-# Serving: the 1.1.0 HTTP server
+# Serving: StartLux and Decider HTTP backends
 
-`decider.serve` (1.1.0) replaces the 1.0.x server, which is kept for one release as `decider.serve_v1`. This document is
-what a maintainer needs: the design, the defaults, the limits, the measurements and how to repeat them. The investigation
-that led here is summarised in the appendix.
+The team fork defaults to StartLux-Decision-0.8B on the existing `decider.serve` application.
+The historical sections below describe the Mapika `EngineV2` path unless stated otherwise.
+
+## StartLux backend (1.3.0)
+
+- Default checkpoint: `startlux-models/StartLux-Decision-0.8B`, pinned to
+  `bd4f76a600e23227547fee7bfc1825e12a32764c`. `deploy.py` downloads data files only;
+  the Apache-2.0 inference sources are vendored unchanged in `decider/_startlux/`.
+  Weights are CC BY-NC 4.0; commercial use needs a separate license from StartLux Labs.
+- `decision_config.json` selects StartLux; `decider_config.json` retains the existing Mapika path.
+  The Windows CUDA adapter uses PyTorch 2.8/cu128, Transformers 5.17.x, FLA 0.5.2 and
+  triton-windows 3.4. It validates convolution/recurrent kernel outputs and states before
+  binding them, captures CUDA graphs, and compares graph/eager probabilities before readiness.
+  No `causal-conv1d`, accelerate, Linux/WSL, slow-path flag spoofing or CPU fallback is required.
+- The official prompt, temperatures, choice/score confidence, letter logits and >26-option
+  multi-round algorithm are retained. `certainty` is added for existing Decider clients.
+  `/decide` translates legacy schemas into official choice questions and retains its response schema.
+- CPU preparation validates complete evidence and caches the exact official prompt tokens.
+  Pending-request, row, request-token and outstanding-row limits apply before any inference.
+  Wide-choice finalist identities are unknown before scoring, so their token bounds conservatively
+  count the UTF-8 bytes of all initial group prompts. Near-limit wide requests can be rejected
+  with 413 even if a particular eventual finalist set would fit; no evidence is truncated.
+- CUDA work stays on the existing sole GPU executor. Disconnects retain capacity until work
+  settles. Requests are not merged across calls; upstream batches questions within each request.
+  `DECIDER_MAX_BATCH`, batching wait/merge knobs, and shared-prefix knobs apply only to Mapika.
+  StartLux uses its own shared-prefix implementation. Independent questions and the default or
+  `state_first` request layout are supported; dependent/schema-cache/FP8/model-wide-compile modes
+  are explicitly rejected. This adapter is text/JSON-only and advertises `images=false`.
+- StartLux's padded row cap is the smaller of `DECIDER_MAX_ROW_TOKENS` and
+  `DECIDER_GRAPH_TOKEN_BUDGET` (minimum 128). Capture shapes and padding stay inside that budget.
+  It retains upstream's eager path for lengths outside the captured grid; unlike EngineV2,
+  this does not promise that every new long shape avoids kernel compilation at runtime.
+- On Windows, compiler caches default to short user-writable paths below `%TEMP%/decider`.
+  Cache path overrides are preserved. The incompatible torch 2.8 static CUDA launcher is disabled,
+  not CUDA, Triton, FLA, or CUDA graphs. Restart the process to change model/bucket configuration.
+- `/health` adds `backend`, `kernel_backend`, `fast_kernels`, `cuda_graphs` and `images`.
+  Wait for both `ok=true` and `cuda_ready=true`; a process/launch banner is not readiness.
+
+## Local model switching
+
+`GET /v1/model-control` reports the cached, immutable StartLux 0.8B and Mapika 0.8B
+catalog, the confirmed active model, readiness and the current switch state. A custom
+local startup checkpoint remains selectable as `startup`; it is not relabeled as a
+verified Hub revision. `DECIDER_MODEL_CACHE` selects the cache (set by `deploy.py`
+from `--cache-dir`). Missing models are disabled: management requests never download
+weights or execute downloaded Python. Install the pinned checkpoint in that cache first.
+
+`POST /v1/model-control` with `{"model":"Mapika/decider-0.8b"}` accepts one switch
+at a time (202; concurrent switches return 409). This mutation requires loopback,
+same-origin JSON access. New inference requests receive 503 while existing accepted
+requests drain, including work whose HTTP client disconnected. The GPU owner then
+releases the old model and its kernel bindings, loads and warms the new model, and
+only then publishes readiness. A loading error attempts to restore the old model;
+if restoration also fails, no active model is reported. Poll status rather than
+treating an accepted request as a completed switch. A browser disconnect does not cancel it.
+
+Selection lasts for this serving process; restart uses the launch configuration.
+Switching can take substantial time and GPU memory during graph capture. It does not
+increase client deadlines or relax request limits. The OWHS WebUI proxies this API
+through `/ai/decider`; it does not own the GPU or change game control state.
 
 ## 1. Why
 
@@ -53,7 +110,7 @@ turned it off (`decider.engine.set_attention_backend_policy`).
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `DECIDER_MODEL` | `runs/r3_v2/model` | model folder or Hub id |
+| `DECIDER_MODEL` | `startlux-models/StartLux-Decision-0.8B` | model folder or Hub id; default StartLux revision pinned above |
 | `DECIDER_DEVICE` | `auto` | `auto` (CUDA, else MPS, else CPU, as `Decider`), `cuda`, `cuda:<i>`, `mps` or `cpu`. Off CUDA: no graphs, no warm-up, every request eager; FP8 and compile refuse to start. On a CPU run of a CUDA machine, uninstall `causal-conv1d` or the Qwen3.5 layers call its CUDA kernel on CPU tensors |
 | `DECIDER_COMPILE` | `0` | torch.compile the forward during warm-up (never at runtime) |
 | `DECIDER_FP8` | `0` | e4m3 weights with per-token activation scaling |

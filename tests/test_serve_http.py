@@ -630,6 +630,7 @@ def test_cuda_readiness_waits_for_warmup_and_owner_thread(monkeypatch):
             return super().score_items(items, temperature)
     monkeypatch.setitem(sys.modules, "decider.engine_v2", SimpleNamespace(EngineV2=OwnedEngine))
     monkeypatch.setattr(serve, "load_config", lambda path: {})
+    monkeypatch.setattr(serve, "MODEL", "legacy-test-model")
     monkeypatch.setattr(serve, "resolve_device", lambda: ("cuda:0", torch.bfloat16))
     monkeypatch.setattr(serve, "WARMUP", True)
     monkeypatch.setattr(serve, "eng", None)

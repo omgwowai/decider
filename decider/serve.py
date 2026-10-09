@@ -44,19 +44,20 @@ Variables (default):  DECIDER_DEVICE (auto: cuda, else mps, else cpu)  DECIDER_C
 import asyncio, json, os, time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from decider import systemone as S1
 from decider.batching import DEFAULT_MERGE_OVERHEAD_TOKENS, plan_batches
 from decider.prompt import build, MAX_OPTIONS, resolve_layout, chat_template
 from decider.prompt_fast import build_rows, unique_tokens, context_ids, ContextTooLong
+from decider.startlux import MODEL as STARTLUX_MODEL, REVISION as STARTLUX_REVISION, is_startlux, configure_environment
 
 
 def _env_int(name, default):
     return int(os.environ.get(name, default))
 
 
-MODEL = os.environ.get("DECIDER_MODEL", "runs/r3_v2/model")
+MODEL = os.environ.get("DECIDER_MODEL", STARTLUX_MODEL)
 MAX_BATCH = _env_int("DECIDER_MAX_BATCH", 32)
 BATCH_WAIT_MS = float(os.environ.get("DECIDER_BATCH_WAIT_MS", os.environ.get("DECIDER_MAX_WAIT_MS", "0")))
 ADAPTIVE_WAIT_MS = float(os.environ.get("DECIDER_BATCH_ADAPTIVE_WAIT_MS", "2"))   # window after a collection that held >1 request; 0 disables
@@ -86,6 +87,10 @@ eng = None; queue = None; gpu = None; cpu = None; batcher_task = None; schema_ta
 outstanding = 0; REQ_SEQ = 0
 pending_requests = set()
 cuda_ready = False
+STARTLUX = False
+model_catalog = None
+model_switch_task = None
+model_switch = dict(state="idle", target=None, error=None)
 stats = dict(requests=0, batches=0, decisions=0, rows=0, shared_prefix_requests=0, errors=0, rejected_too_large=0,
              rejected_overloaded=0, batch_hist={}, bucket_hist={})
 
@@ -410,7 +415,24 @@ def resolve_device(requested=None):
 
 def _load_engine():
     """Create, warm and seal every GPU object on the inference executor's sole owner thread."""
-    global eng, se, CHAT, cuda_ready
+    global eng, se, CHAT, cuda_ready, STARTLUX, MODEL_NAME, LAYOUT, SCHEMA_FIRST
+    path = MODEL
+    if MODEL == STARTLUX_MODEL:
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(repo_id=MODEL, revision=STARTLUX_REVISION,
+                                 allow_patterns=["*.json", "*.safetensors", "*.jinja", "tokenizer*", "vocab*", "merges*", "LICENSE", "NOTICE"])
+    STARTLUX = is_startlux(path)
+    if STARTLUX:
+        if not WARMUP or FP8 or COMPILE or os.environ.get("DECIDER_SCHEMA_CACHE", "0") == "1":
+            raise ValueError("StartLux requires warmup; FP8, model-wide compile and schema-cache modes are unsupported")
+        configure_environment(os.environ)
+        from decider.startlux import StartLuxEngine
+        dev, _ = resolve_device()
+        eng = StartLuxEngine(path, dev, MAX_STATE_TOKENS, MAX_ROW_TOKENS, GRAPH_TOKEN_BUDGET)
+        MODEL_NAME, LAYOUT, SCHEMA_FIRST, CHAT = STARTLUX_MODEL, "startlux", False, None
+        cuda_ready = True
+        print("[serve] StartLux kernels", json.dumps(eng.kernel_report), flush=True)
+        return
     import torch
     from decider.engine_v2 import EngineV2
     apply_config(load_config(MODEL))
@@ -440,12 +462,15 @@ def _load_engine():
 
 
 async def _start():
-    global gpu, cuda_ready
+    global gpu, cuda_ready, model_catalog, model_switch
     cuda_ready = False
     gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(gpu, _load_engine)
     start_workers(loop)
+    from decider.model_catalog import Catalog
+    model_catalog = Catalog(MODEL, MODEL_NAME)
+    model_switch = dict(state="idle", target=None, error=None)
     print("[serve] ready", json.dumps(dict(model=MODEL_NAME, layout=LAYOUT, cuda_ready=cuda_ready,
                                           graphs=len(eng.graphs), max_queue_rows=MAX_QUEUE_ROWS)), flush=True)
 
@@ -453,6 +478,8 @@ async def _start():
 def _stop():
     global gpu, cpu, batcher_task, schema_task, cuda_ready
     cuda_ready = False
+    if model_switch_task is not None and not model_switch_task.done():
+        model_switch_task.cancel()
     for task in pending_requests:
         task.cancel()
     for t in (batcher_task, schema_task):
@@ -512,6 +539,8 @@ async def _queued(items):
 
 async def _bounded_request(fn, request):
     """Bound work before submitting tokenization; disconnects cannot free a still-running GPU reservation."""
+    if model_switch_task is not None and not model_switch_task.done():
+        raise HTTPException(503, "model switch in progress; retry after readiness returns")
     if not _alive():
         raise HTTPException(503, "inference workers are not ready")
     if len(pending_requests) >= MAX_PENDING_REQUESTS:
@@ -533,6 +562,20 @@ async def decide(r: Req):
 
 
 async def _decide(r):
+    if STARTLUX:
+        from decider.infer import Decider
+        import numpy as np
+        try:
+            qs = Decider._schema_to_questions(r.schema_)
+        except (ValueError, KeyError) as e:
+            raise HTTPException(422, str(e)) from e
+        questions = {str(i): {"type": "choice", "instructions": q["question"],
+                             "criteria": {str(j): option for j, option in enumerate(q["options"])}}
+                     for i, q in enumerate(qs)}
+        reply = await _startlux_systemone(S1Req(state=r.context, questions=questions))
+        probs = [np.asarray([reply["answers"][str(i)]["probabilities"][str(j)]
+                             for j in range(len(q["options"]))]) for i, q in enumerate(qs)]
+        return _format_decide(r.schema_, qs, probs)
     loop = asyncio.get_running_loop()
     try:
         qs, it = await loop.run_in_executor(cpu, _prepare_decide, r.context, r.schema_)
@@ -558,7 +601,37 @@ async def systemone(r: S1Req):
     return await _bounded_request(_systemone, r)
 
 
+async def _startlux_systemone(r):
+    from decider.startlux import StateTooLong
+    if not r.independent or r.layout not in (None, "state_first"):
+        raise HTTPException(422, "StartLux uses independent questions with its official prompt layout")
+    loop = asyncio.get_running_loop()
+    try:
+        prepared = await loop.run_in_executor(cpu, eng.prepare, r.state, r.questions)
+    except StateTooLong as e:
+        stats["rejected_too_large"] += 1
+        raise HTTPException(413, str(e)) from e
+    except (ValueError, TypeError, KeyError) as e:
+        stats["errors"] += 1
+        raise HTTPException(422, str(e)) from e
+    check_size(prepared.lengths, max_row_tokens=min(MAX_ROW_TOKENS, getattr(eng, "max_row_tokens", MAX_ROW_TOKENS)))
+    _admit(len(prepared.lengths))
+    try:
+        answers, usage = await loop.run_in_executor(gpu, eng.decide, prepared)
+    except Exception:
+        stats["errors"] += 1
+        raise
+    finally:
+        _release(len(prepared.lengths))
+    stats["requests"] += 1
+    stats["decisions"] += len(r.questions)
+    stats["rows"] += len(prepared.lengths)
+    return {"model": MODEL_NAME, "answers": answers, "usage": usage}
+
+
 async def _systemone(r):
+    if STARTLUX:
+        return await _startlux_systemone(r)
     loop = asyncio.get_running_loop()
     if SCHEMA_FIRST and r.questions and r.layout != "state_first" and _worth_caching(r.questions, r.independent):
         try:                                       # CPU: rows, prefix lengths, suffix ids -> the complete cost before any GPU work
@@ -601,6 +674,121 @@ async def _systemone(r):
             "usage": {"input_tokens": unique_tokens(items, ctx_len), "output_tokens": 0}}
 
 
+def _unload_engine():
+    """Release model-owned CUDA state only on the GPU owner, after requests drain."""
+    global eng, se, CHAT, cuda_ready
+    import gc
+    import sys
+    import torch
+    cuda_ready = False
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    eng = se = CHAT = None
+    schemas.clear()
+    seen.clear()
+    kernels = sys.modules.get("decider.startlux_kernels")
+    if kernels is not None:
+        kernels.restore()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _try_model(path):
+    global MODEL
+    MODEL = path
+    try:
+        _load_engine()
+    except Exception as exc:
+        # Return text, not a traceback retaining a partially allocated model.
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+async def _switch_model(model_id, path):
+    global model_switch, batcher_task, schema_task
+    previous = MODEL
+    loop = asyncio.get_running_loop()
+    model_switch = dict(state="draining", target=model_id, error=None)
+    if pending_requests:
+        await asyncio.gather(*list(pending_requests), return_exceptions=True)
+    workers = [task for task in (batcher_task, schema_task) if task is not None]
+    for task in workers:
+        task.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
+    batcher_task = schema_task = None
+    model_switch["state"] = "loading"
+    try:
+        await loop.run_in_executor(gpu, _unload_engine)
+        error = await loop.run_in_executor(gpu, _try_model, path)
+        if error:
+            model_switch.update(state="restoring", error=error)
+            await loop.run_in_executor(gpu, _unload_engine)
+            rollback_error = await loop.run_in_executor(gpu, _try_model, previous)
+            if rollback_error:
+                await loop.run_in_executor(gpu, _unload_engine)
+                raise RuntimeError("Model load failed: " + error + "; previous model restore failed: " + rollback_error)
+            start_workers(loop)
+            model_switch.update(state="failed", error=error)
+        else:
+            start_workers(loop)
+            model_catalog.active = model_id
+            model_switch.update(state="idle", error=None)
+    except Exception as exc:
+        model_switch.update(state="failed", error=f"{type(exc).__name__}: {exc}")
+
+
+async def _model_status():
+    if model_catalog is None:
+        raise HTTPException(503, "model control is not initialized")
+    rows = await asyncio.get_running_loop().run_in_executor(cpu, model_catalog.refresh)
+    ready = (await health())["ok"]
+    return dict(ok=True, models=rows, active=model_catalog.active if ready else None,
+                name=MODEL_NAME if ready else None, ready=ready,
+                pending=model_switch_task is not None and not model_switch_task.done(),
+                switch=dict(model_switch), persistence="serving_session")
+
+
+@app.get("/v1/model-control")
+async def model_status():
+    return await _model_status()
+
+
+class ModelSelection(BaseModel):
+    model: str
+    model_config = {"extra": "forbid", "strict": True}
+
+
+@app.post("/v1/model-control", status_code=202)
+async def select_model(selection: ModelSelection, request: Request):
+    global model_switch_task, model_switch
+    import ipaddress
+    try:
+        local = ipaddress.ip_address(request.client.host).is_loopback
+    except (ValueError, AttributeError):
+        local = False
+    origin = request.headers.get("origin")
+    if (not local or request.url.hostname not in ("127.0.0.1", "localhost", "::1") or
+            origin is not None and origin != str(request.base_url).rstrip("/")):
+        raise HTTPException(403, "model changes require local same-origin access")
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        raise HTTPException(415, "application/json required")
+    if model_catalog is None:
+        raise HTTPException(503, "model control is not initialized")
+    if model_switch_task is not None and not model_switch_task.done():
+        raise HTTPException(409, "another model switch is pending")
+    # Resolve locally before closing admission. Never download code or weights from a UI request.
+    try:
+        path = model_catalog.resolve(selection.model)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if selection.model == model_catalog.active and (await health())["ok"]:
+        return await _model_status()
+    model_switch = dict(state="draining", target=selection.model, error=None)
+    model_switch_task = asyncio.create_task(_switch_model(selection.model, path))
+    return dict(ok=True, pending=True, target=selection.model)
+
+
 @app.get("/v1/models")
 async def models():
     return {"models": [{"name": MODEL_NAME, "description": "decider: one-pass typed decisions with calibrated probabilities", "release_date": RELEASE_DATE}]}
@@ -609,10 +797,15 @@ async def models():
 @app.get("/health")
 async def health():
     device = str(getattr(eng, "dev", "")) if eng is not None else None
-    ok = eng is not None and bool(getattr(eng, "sealed", True)) and _alive()
+    switching = model_switch_task is not None and not model_switch_task.done()
+    ok = not switching and eng is not None and bool(getattr(eng, "sealed", True)) and _alive()
     if device and device.startswith("cuda"):
         ok = ok and cuda_ready
-    return {"ok": ok, "model": MODEL, "device": device, "layout": LAYOUT, "cuda_ready": bool(ok and cuda_ready)}
+    result = {"ok": ok, "model": MODEL, "device": device, "layout": LAYOUT, "cuda_ready": bool(ok and cuda_ready)}
+    if not switching and STARTLUX and eng is not None:
+        result.update(backend="torch", kernel_backend=eng.kernel_report["backend"],
+                      fast_kernels=eng.kernel_report["validated"], cuda_graphs=len(eng.graphs), images=False)
+    return result
 
 
 @app.get("/stats")
