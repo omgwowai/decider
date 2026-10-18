@@ -81,6 +81,24 @@ def test_wide_choice_keeps_all_probabilities_and_bounds_every_round(n):
     assert engine.model.prepared_tokens is None
 
 
+@pytest.mark.parametrize("n", [27, 39, 50, 255])
+def test_wide_choice_later_round_bound_counts_state_once(n):
+    # A large state with long, unequal options: the old bound summed every
+    # first-round prompt (one state per group) and rejected a 39-option row at
+    # about 1.5x the limit although no rendered row came close to it.
+    engine = Engine()
+    state = {"target": {"current_state": "x" * 1700}}
+    criteria = {f"c{i:03d}": ("long " * (i % 40)) + "option " + str(i) for i in range(n)}
+    questions = {"pick": {"type": "choice", "instructions": "Choose", "criteria": criteria}}
+    prepared = engine.prepare(state, questions)
+    engine.decide(prepared)
+    assert len(prepared.lengths) == len(engine.lengths)
+    assert all(bound >= actual for bound, actual in zip(prepared.lengths, engine.lengths))
+    groups = -(-n // 25)
+    first_round = prepared.lengths[:groups]
+    assert max(prepared.lengths[groups:]) < len(J.state_text(state)) + max(first_round)
+
+
 def test_typed_answers_keep_official_confidence_score_and_singleton():
     engine = Engine()
     questions = {

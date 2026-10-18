@@ -43,13 +43,32 @@ class StateTooLong(ValueError):
     pass
 
 
+def _later_round_bound(tok, text, question, keys):
+    """-> f(m): a UTF-8 byte bound for any later-round prompt holding m of `keys`.
+
+    A later round renders the same state and instructions with a subset of the
+    options, so its prompt is the fixed text plus m option lines joined by "\\n".
+    Every line is bounded by its longest rendering ("Z) id: criterion"), and m
+    lines by the m longest of those, whichever options actually advance.
+    """
+    criteria = question["criteria"]
+    pair = J.from_systemone(text, dict(question, criteria={key: criteria[key] for key in keys[:2]}))
+    messages, order = J.messages(pair)
+    prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    fixed = len(prompt.encode("utf-8")) - sum(len(line.encode("utf-8")) for line in J.option_lines(pair, order)) - 1
+    lines = sorted((len(f"Z) {option['id']}: {option['criterion'] or ''}".encode("utf-8"))
+                    for option in J.from_systemone(text, question)["options"]), reverse=True)
+    return lambda m: fixed + sum(lines[:m]) + m - 1
+
+
 def prepare(tok, state, questions, max_state_tokens, group=25, keep=3):
     """Validate and bound all work before GPU admission; never truncate evidence.
 
-    Wide choices retain upstream's multi-round algorithm. Their not-yet-selected
-    finalist prompts use a conservative UTF-8 byte bound (Qwen's byte BPE cannot
-    produce more tokens than bytes), including every initial option and prompt.
-    This may reject a wide request near a configured limit, never undercount it.
+    Wide choices retain upstream's multi-round algorithm. First-round rows are
+    rendered exactly. Not-yet-selected later rounds use a conservative UTF-8 byte
+    bound (Qwen's byte BPE cannot produce more tokens than bytes): one state and
+    instruction block plus that round's longest possible option lines. Each row
+    is bounded on its own; the state is never counted once per first-round group.
     """
     text = J.state_text(state)
     if len(tok.encode(text, add_special_tokens=False)) > max_state_tokens:
@@ -78,7 +97,6 @@ def prepare(tok, state, questions, max_state_tokens, group=25, keep=3):
                 specs.append(dict(question, criteria={key: criteria[key] for key in keys[start:end]}))
                 finalists += min(keep, end-start)
                 start = end
-        byte_bound = 0
         for spec in specs:
             row = J.from_systemone(text, spec)
             messages, order = J.messages(row)
@@ -86,14 +104,14 @@ def prepare(tok, state, questions, max_state_tokens, group=25, keep=3):
             ids = tok.encode(prompt, add_special_tokens=False)
             cache[row_key(row, order)] = ids
             lengths.append(len(ids))
-            byte_bound += len(prompt.encode("utf-8"))
         if wide:
+            bound = _later_round_bound(tok, text, question, keys)
             while finalists > J.MAX_OPTIONS:
                 groups = -(-finalists // group)
                 size, extra = divmod(finalists, groups)
-                lengths.extend([byte_bound] * groups)
+                lengths.extend(bound(size + (index < extra)) for index in range(groups))
                 finalists = sum(min(keep, size + (index < extra)) for index in range(groups))
-            lengths.append(byte_bound)
+            lengths.append(bound(finalists))
     return Prepared(text, questions, cache, lengths)
 
 
